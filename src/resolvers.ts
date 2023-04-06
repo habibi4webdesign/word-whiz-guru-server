@@ -1,48 +1,96 @@
-import { Translation, TranslationDocument } from "./models/translation.model";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import { Category, CategoryDocument } from "./models/category.model";
+import { Translation, TranslationDocument } from "./models/translation.model";
 import {
   User,
   UserDocument,
   UserDocumentWithOutPassword,
 } from "./models/user.model";
-import { ApolloError } from "apollo-server";
-
-const removePassword = (user: any): UserDocumentWithOutPassword => {
-  const userObj = user.toObject();
-  const { password, ...userWithoutPassword } = userObj;
-  return {
-    id: userObj._id,
-    ...userWithoutPassword,
-  };
-};
-
-const createToken = (
-  user: UserDocument,
-  secret: string,
-  expiresIn: string,
-  type: string
-) => {
-  const { id, email } = user;
-  return jwt.sign({ id, email, type }, secret, { expiresIn });
-};
+import {
+  assignToFirstBox,
+  checkUserAuthentication,
+  createToken,
+  removePassword,
+} from "./utils";
 
 const SECRET = process.env.JWT_SECRET || "your-secret-key";
 
 export const resolvers = {
   Query: {
+    getUserCategories: async (
+      _: any,
+      __: {},
+      context: { user: UserDocument }
+    ): Promise<CategoryDocument[]> => {
+      checkUserAuthentication(context.user);
+      try {
+        const categories = await Category.find({ userId: context.user.id });
+        return categories;
+      } catch (error) {
+        throw new Error(`Error fetching user categories: ${error}`);
+      }
+    },
+
+    getTranslationsToReview: async (
+      _: any,
+      {
+        questionSource,
+        category,
+      }: { questionSource?: string; category?: string },
+      context: { user: UserDocument }
+    ): Promise<TranslationDocument[]> => {
+      checkUserAuthentication(context.user);
+
+      const currentDate = new Date();
+      const translationsToReview: TranslationDocument[] = [];
+
+      try {
+        let queryConditions: any = {
+          userId: context.user.id,
+        };
+
+        if (questionSource) {
+          queryConditions.questionSource = questionSource;
+        }
+
+        if (category) {
+          queryConditions.category = category;
+        }
+
+        const translations = await Translation.find(queryConditions);
+
+        for (const translation of translations) {
+          for (const box of translation.boxes) {
+            const daysBetween = Math.ceil(
+              (currentDate.getTime() - box.lastReviewed.getTime()) /
+                (1000 * 60 * 60 * 24)
+            );
+
+            if (daysBetween >= Math.pow(2, box.boxNumber - 1)) {
+              translationsToReview.push(translation);
+              break;
+            }
+          }
+
+          // Limit the translations to review based on the user's daily goal
+          if (translationsToReview.length >= context.user.dailyGoal) {
+            break;
+          }
+        }
+
+        return translationsToReview;
+      } catch (error) {
+        throw new Error(`Error fetching translations to review: ${error}`);
+      }
+    },
+
     getTranslations: async (
       _: any,
       args: { category?: string },
       context: { user: UserDocument }
     ): Promise<TranslationDocument[]> => {
-      if (!context.user) {
-        throw new ApolloError(
-          "Authentication required.",
-          "AUTHENTICATION_REQUIRED",
-          { statusCode: 401 }
-        );
-      }
+      checkUserAuthentication(context.user);
       const { category = "all" } = args;
 
       let translations: TranslationDocument[] = [];
@@ -65,15 +113,9 @@ export const resolvers = {
       __: {},
       context: { user: UserDocument | null }
     ): Promise<UserDocument | null> => {
-      if (!context.user) {
-        throw new ApolloError(
-          "Authentication required.",
-          "AUTHENTICATION_REQUIRED",
-          { statusCode: 401 }
-        );
-      }
+      checkUserAuthentication(context.user);
       try {
-        const user = await User.findById(context.user.id).select("-password");
+        const user = await User.findById(context.user!.id).select("-password");
         return user;
       } catch (error) {
         throw new Error(`Error fetching user: ${error}`);
@@ -82,22 +124,64 @@ export const resolvers = {
   },
 
   Mutation: {
+    updateTranslationReview: async (
+      _: any,
+      args: { translationId: string; difficulty: string },
+      context: { user: UserDocument }
+    ): Promise<TranslationDocument> => {
+      checkUserAuthentication(context.user);
+
+      try {
+        const translation = await Translation.findById(args.translationId);
+
+        if (!translation || translation.userId.toString() !== context.user.id) {
+          throw new Error("Translation not found.");
+        }
+
+        const currentDate = new Date();
+        let updated = false;
+
+        for (const box of translation.boxes) {
+          const daysBetween = Math.ceil(
+            (currentDate.getTime() - box.lastReviewed.getTime()) /
+              (1000 * 60 * 60 * 24)
+          );
+
+          if (daysBetween >= Math.pow(2, box.boxNumber - 1)) {
+            if (args.difficulty === "easy") {
+              box.boxNumber += 2;
+            } else if (args.difficulty === "hard") {
+              box.boxNumber = Math.max(1, box.boxNumber - 1);
+            } else {
+              box.boxNumber++;
+            }
+            box.lastReviewed = currentDate;
+            updated = true;
+            break;
+          }
+        }
+        if (!updated) {
+          throw new Error("No box found to update.");
+        }
+
+        await translation.save();
+        return translation;
+      } catch (error) {
+        throw new Error(`Error updating translation review: ${error}`);
+      }
+    },
+
     addTranslation: async (
       _: any,
       args: {
         category?: string;
         question: string;
         answer: { type: string; translations: string[] }[];
+        questionSource: string;
       },
       context: { user: UserDocument }
     ): Promise<TranslationDocument> => {
-      if (!context.user) {
-        throw new ApolloError(
-          "Authentication required.",
-          "AUTHENTICATION_REQUIRED",
-          { statusCode: 401 }
-        );
-      }
+      checkUserAuthentication(context.user);
 
       try {
         const newTranslation = new Translation({
@@ -105,15 +189,33 @@ export const resolvers = {
           question: args.question,
           answer: args.answer,
           userId: context.user.id,
+          questionSource: args.questionSource,
         });
 
+        assignToFirstBox(newTranslation);
+
         await newTranslation.save();
+
+        // Check and insert new category if it doesn't exist
+        const existingCategory = await Category.findOne({
+          userId: context.user.id,
+          category: args.category || "all",
+        });
+
+        if (!existingCategory) {
+          const newCategory = new Category({
+            category: args.category || "all",
+            userId: context.user.id,
+          });
+
+          await newCategory.save();
+        }
+
         return newTranslation;
       } catch (error) {
         throw new Error(`Error adding translation: ${error}`);
       }
     },
-
     signUp: async (
       _: any,
       args: { email: string; password: string }
@@ -134,8 +236,8 @@ export const resolvers = {
           password: hashedPassword,
         });
 
-        const accessToken = createToken(newUser, SECRET, "30s", "access");
-        const refreshToken = createToken(newUser, SECRET, "2m", "refresh");
+        const accessToken = createToken(newUser, SECRET, "10m", "access");
+        const refreshToken = createToken(newUser, SECRET, "5d", "refresh");
         // Add the refreshToken to the newUser's refreshTokens array
         if (!newUser.refreshTokens.includes(refreshToken)) {
           newUser.refreshTokens.push(refreshToken);
@@ -174,9 +276,9 @@ export const resolvers = {
         }
 
         //1d
-        const accessToken = createToken(user, SECRET, "30s", "access");
+        const accessToken = createToken(user, SECRET, "10m", "access");
         //30d
-        const refreshToken = createToken(user, SECRET, "2m", "refresh");
+        const refreshToken = createToken(user, SECRET, "5d", "refresh");
 
         if (!user.refreshTokens.includes(refreshToken)) {
           // Add the refreshToken to the user refreshTokens array
@@ -195,7 +297,6 @@ export const resolvers = {
       _: any,
       args: { refreshToken: string }
     ): Promise<{ token: string; user: UserDocument }> => {
-     
       try {
         const decodedToken = jwt.verify(args.refreshToken, SECRET) as {
           id: string;
@@ -206,13 +307,17 @@ export const resolvers = {
         }
 
         const user = await User.findById(decodedToken.id);
+        checkUserAuthentication(user);
+
         if (!user || !user.refreshTokens.includes(args.refreshToken)) {
           throw new Error("Invalid or expired refresh token.");
         }
 
-        const newAccessToken = createToken(user, SECRET, "30s", "access");
+        const newAccessToken = createToken(user, SECRET, "10m", "access");
         return { token: newAccessToken, user };
       } catch (error) {
+        checkUserAuthentication(null, `Error refreshing token: ${error}`);
+
         throw new Error(`Error refreshing token: ${error}`);
       }
     },

@@ -27,19 +27,34 @@ export const typeDefs = gql`
     translations: [String!]!
   }
 
+  type Box {
+    boxNumber: Int!
+    lastReviewed: String!
+  }
+
   type Translation {
     id: ID!
+    questionSource: String
     category: String
     question: String!
     answer: [WordType!]!
     userId: String!
+    boxes: [Box!]!
+    createdAt: String!
+    updatedAt: String!
+  }
+
+  type Category {
+    category: String!
     createdAt: String!
     updatedAt: String!
   }
 
   type Query {
     getTranslations(category: String): [Translation!]!
+    getTranslationsToReview(questionSource: String,category: String): [Translation!]!
     getUser: User
+    getUserCategories: [Category!]!
   }
 
   type Mutation {
@@ -47,7 +62,9 @@ export const typeDefs = gql`
       category: String
       question: String!
       answer: [WordTypeInput!]!
+      questionSource: String
     ): Translation!
+    updateTranslationReview(translationId: ID!, difficulty: String!): Translation
     signUp(email: String!, password: String!): AuthPayload!
     signIn(email: String!, password: String!): AuthPayload!
     refreshToken(refreshToken: String!): AuthPayload!

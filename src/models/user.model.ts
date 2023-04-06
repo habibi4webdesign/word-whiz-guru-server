@@ -5,6 +5,7 @@ export interface UserDocument extends Document {
   password: string;
   translations: [string];
   refreshTokens: string[];
+  dailyGoal: number;
 }
 
 export interface UserDocumentWithOutPassword {
@@ -12,6 +13,7 @@ export interface UserDocumentWithOutPassword {
   email: string;
   translations: [string];
   refreshTokens: string[];
+  dailyGoal: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -22,6 +24,7 @@ const userSchema = new Schema<UserDocument>(
     password: { type: String, required: true },
     translations: [{ type: Schema.Types.ObjectId, ref: "Translation" }],
     refreshTokens: { type: [String], default: [] },
+    dailyGoal: { type: Number, default: 10 },
   },
   { timestamps: true }
 );
