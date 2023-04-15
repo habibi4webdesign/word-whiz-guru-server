@@ -1,11 +1,14 @@
 import { model, Document, Schema } from "mongoose";
 
 export interface UserDocument extends Document {
+  username: string;
   email: string;
   password: string;
   translations: [string];
   refreshTokens: string[];
   dailyGoal: number;
+  defaultSourceLanguage: string;
+  defaultTargetLanguage: string;
 }
 
 export interface UserDocumentWithOutPassword {
@@ -25,6 +28,14 @@ const userSchema = new Schema<UserDocument>(
     translations: [{ type: Schema.Types.ObjectId, ref: "Translation" }],
     refreshTokens: { type: [String], default: [] },
     dailyGoal: { type: Number, default: 10 },
+    defaultSourceLanguage: {
+      type: String,
+      default: "en",
+    },
+    defaultTargetLanguage: {
+      type: String,
+      default: "es",
+    },
   },
   { timestamps: true }
 );

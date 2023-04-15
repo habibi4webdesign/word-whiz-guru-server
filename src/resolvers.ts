@@ -14,10 +14,33 @@ import {
   removePassword,
 } from "./utils";
 
+import { translate } from "@vitalets/google-translate-api";
+import { ApolloError } from "apollo-server-express";
+import { ProgressStats, LastReviewedVocab, UserWithOutPassword } from "./types";
+
 const SECRET = process.env.JWT_SECRET || "your-secret-key";
 
 export const resolvers = {
   Query: {
+    detectLanguage: async (_: any, { text }: { text: string }) => {
+      console.log(text);
+
+      try {
+        const { text: translatedText, raw } = await translate(text);
+        console.log("🚀 ~ file: resolvers.ts:28 ~ detectLanguage: ~ raw:", raw);
+        console.log(
+          "🚀 ~ file: resolvers.ts:28 ~ detectLanguage: ~ translatedText:",
+          translatedText
+        );
+        return {
+          text: translatedText,
+          detectedLanguage: raw.src,
+        };
+      } catch (err) {
+        console.error(err);
+        throw new Error("Error detecting language");
+      }
+    },
     getUserCategories: async (
       _: any,
       __: {},
@@ -121,9 +144,305 @@ export const resolvers = {
         throw new Error(`Error fetching user: ${error}`);
       }
     },
+    getProgressStats: async (
+      _: any,
+      __: {},
+      context: { user: UserDocument }
+    ): Promise<ProgressStats> => {
+      checkUserAuthentication(context.user);
+
+      try {
+        const translations = await Translation.find({
+          userId: context.user.id,
+        });
+        const categories = await Category.find({ userId: context.user.id });
+        const allUsers = await User.find();
+
+        const totalWords = translations.length;
+
+        const vocabsByBox = [0, 0, 0, 0, 0];
+        const lastReviewedVocabs: LastReviewedVocab[] = [];
+        let completedReviews = 0;
+
+        let wordsNotLearnedYet = 0;
+        let newCardsCount = 0;
+        let reviewDaysCount = 0;
+        let missedDaysCount = 0;
+
+        translations.forEach((translation) => {
+          const lastBox = translation.boxes[translation.boxes.length - 1];
+          vocabsByBox[lastBox.boxNumber - 1]++;
+
+          lastReviewedVocabs.push({
+            translationId: translation.id,
+            question: translation.question,
+            boxNumber: lastBox.boxNumber,
+            lastReviewed: lastBox.lastReviewed,
+          });
+
+          if (lastBox.boxNumber === 5) {
+            completedReviews++;
+          } else {
+            wordsNotLearnedYet++;
+          }
+
+          if (lastBox.boxNumber === 1 && translation.boxes.length === 1) {
+            newCardsCount++;
+          }
+          reviewDaysCount = new Set(
+            translation.boxes.map((box) => box.lastReviewed.toDateString())
+          ).size;
+        });
+
+        const today = new Date() || 0;
+        const firstReviewDate = new Date(
+          Math.min(...translations.map((t) => t.createdAt.getTime()))
+        );
+        let totalDays = 0;
+        if (firstReviewDate) {
+          totalDays = Math.ceil(
+            (today.getTime() - firstReviewDate.getTime()) /
+              (1000 * 60 * 60 * 24)
+          );
+        }
+
+        missedDaysCount = totalDays - reviewDaysCount;
+
+        lastReviewedVocabs.sort(
+          (a, b) => b.lastReviewed.getTime() - a.lastReviewed.getTime()
+        );
+
+        const dailyReviewCount = context.user.dailyGoal || 1;
+        const reviewFrequency = [1, 2, 4, 7, 15]; // Change this array according to your desired review frequencies (in days) for each box
+
+        let totalExpectedReviews = 0;
+        translations.forEach((translation) => {
+          const lastBox = translation.boxes[translation.boxes.length - 1];
+          if (lastBox.boxNumber < 5) {
+            totalExpectedReviews += reviewFrequency[lastBox.boxNumber - 1];
+          }
+        });
+
+        const daysToLearnRemainingWords = totalExpectedReviews
+          ? Math.ceil(totalExpectedReviews / dailyReviewCount)
+          : 0;
+
+        const userRank =
+          allUsers
+            .map((user) => user.id)
+            .sort(
+              (a, b) =>
+                translations.filter(
+                  (t) =>
+                    t.userId === b &&
+                    t.boxes[t.boxes.length - 1].boxNumber === 5
+                ).length -
+                translations.filter(
+                  (t) =>
+                    t.userId === a &&
+                    t.boxes[t.boxes.length - 1].boxNumber === 5
+                ).length
+            )
+            .indexOf(context.user.id) + 1;
+
+        const username = context.user.email.substring(
+          0,
+          context.user.email.lastIndexOf("@")
+        );
+
+        const userEmail = context.user.email;
+
+        const categoryWithWordsCount = categories.map((category) => {
+          const wordsInCategory = translations.filter(
+            (translation) => translation.category === category.category
+          );
+
+          const wordsCount = wordsInCategory.length;
+
+          const wordsNotLearnedYet = wordsInCategory.filter(
+            (translation) =>
+              translation.boxes[translation.boxes.length - 1].boxNumber !== 5
+          ).length;
+
+          return {
+            categoryId: category.id,
+            category: category.category,
+            wordsCount,
+            wordsNotLearnedYet,
+          };
+        });
+
+        const stats: ProgressStats = {
+          totalWords,
+          vocabsByBox,
+          completedReviews,
+          wordsNotLearnedYet,
+          daysToLearnRemainingWords,
+          userRank,
+          newCardsCount,
+          reviewDaysCount,
+          missedDaysCount,
+          user: {
+            email: userEmail,
+            username,
+          },
+          categories: categoryWithWordsCount,
+        };
+
+        return stats;
+      } catch (error) {
+        throw new Error(`Error fetching progress stats: ${error}`);
+      }
+    },
   },
 
   Mutation: {
+    updateUserDefaultLanguages: async (
+      _: any,
+      {
+        defaultSourceLanguage,
+        defaultTargetLanguage,
+      }: {
+        defaultSourceLanguage?: string;
+        defaultTargetLanguage?: string;
+      },
+      context: { user: UserDocument | null }
+    ): Promise<UserWithOutPassword> => {
+      checkUserAuthentication(context.user);
+
+      const updates: { [key: string]: string } = {};
+
+      if (defaultSourceLanguage) {
+        updates.defaultSourceLanguage = defaultSourceLanguage;
+      }
+
+      if (defaultTargetLanguage) {
+        updates.defaultTargetLanguage = defaultTargetLanguage;
+      }
+
+      try {
+        const user = await User.findByIdAndUpdate(context.user!.id, updates, {
+          new: true,
+          select: "-password",
+        });
+
+        if (!user) {
+          throw new Error("User not found");
+        }
+
+        return user;
+      } catch (error) {
+        throw new Error(`Error updating user default languages: ${error}`);
+      }
+    },
+
+    createCategory: async (
+      _: any,
+      args: { category: string },
+      context: { user: UserDocument }
+    ): Promise<CategoryDocument> => {
+      checkUserAuthentication(context.user);
+
+      if (!args.category || args.category.trim() === "") {
+        throw new ApolloError(
+          "Category cannot be null or empty.",
+          "CATEGORY_NULL_OR_EMPTY",
+          { statusCode: 400 }
+        );
+      }
+
+      try {
+        const existingCategory = await Category.findOne({
+          userId: context.user.id,
+          category: args.category,
+        });
+
+        if (existingCategory) {
+          throw new Error("Category already exists.");
+        }
+
+        const newCategory = new Category({
+          category: args.category,
+          userId: context.user.id,
+        });
+
+        await newCategory.save();
+        return newCategory;
+      } catch (error) {
+        throw new Error(`Error creating category: ${error}`);
+      }
+    },
+    deleteCategory: async (
+      _: any,
+      args: { categoryId: string },
+      context: { user: UserDocument }
+    ): Promise<CategoryDocument> => {
+      checkUserAuthentication(context.user);
+
+      if (!args.categoryId) {
+        throw new ApolloError(
+          "Category ID cannot be null or empty.",
+          "CATEGORY_ID_NULL_OR_EMPTY",
+          { statusCode: 400 }
+        );
+      }
+
+      try {
+        const existingCategory = await Category.findById(args.categoryId);
+
+        if (!existingCategory) {
+          throw new ApolloError("Category not found.", "CATEGORY_NOT_FOUND", {
+            statusCode: 404,
+          });
+        }
+
+        if (existingCategory.userId.toString() !== context.user.id) {
+          throw new ApolloError("Unauthorized action.", "UNAUTHORIZED_ACTION", {
+            statusCode: 403,
+          });
+        }
+
+        // Delete all translations associated with the category
+        await Translation.deleteMany({
+          userId: context.user.id,
+          category: existingCategory.category,
+        });
+
+        // Delete the category
+        await Category.deleteOne({ _id: args.categoryId });
+        return existingCategory;
+      } catch (error) {
+        throw new ApolloError(
+          `Error deleting category: ${error}`,
+          "DELETE_CATEGORY_ERROR"
+        );
+      }
+    },
+
+    updateUserDailyGoal: async (
+      _: any,
+      { dailyGoal }: { dailyGoal: number },
+      context: { user: UserDocument }
+    ): Promise<UserDocument> => {
+      console.log("🚀 ~ file: resolvers.ts:341 ~ dailyGoal:", dailyGoal);
+      checkUserAuthentication(context.user);
+
+      try {
+        const updatedUser = await User.findByIdAndUpdate(
+          context.user.id,
+          { dailyGoal },
+          { new: true }
+        );
+
+        if (!updatedUser) {
+          throw new Error("User not found");
+        }
+
+        return updatedUser;
+      } catch (error) {
+        throw new Error(`Error updating user daily goal: ${error}`);
+      }
+    },
     updateTranslationReview: async (
       _: any,
       args: { translationId: string; difficulty: string },
